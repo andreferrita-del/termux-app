@@ -167,8 +167,44 @@ jobs:
                   int slaveFd = -1;
                   
                   if (usePty) {
-                      if (openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
-                          LOGE("Falha ao abrir PTY");
+                      // Usa posix_openpt em vez de openpty
+                      masterFd = posix_openpt(O_RDWR | O_NOCTTY);
+                      if (masterFd == -1) {
+                          LOGE("posix_openpt falhou: %s", strerror(errno));
+                          freeCharArray(cmdArgs);
+                          freeCharArray(envArgs);
+                          return 0;
+                      }
+                      
+                      if (grantpt(masterFd) == -1) {
+                          LOGE("grantpt falhou: %s", strerror(errno));
+                          close(masterFd);
+                          freeCharArray(cmdArgs);
+                          freeCharArray(envArgs);
+                          return 0;
+                      }
+                      
+                      if (unlockpt(masterFd) == -1) {
+                          LOGE("unlockpt falhou: %s", strerror(errno));
+                          close(masterFd);
+                          freeCharArray(cmdArgs);
+                          freeCharArray(envArgs);
+                          return 0;
+                      }
+                      
+                      char* slaveName = ptsname(masterFd);
+                      if (slaveName == nullptr) {
+                          LOGE("ptsname falhou: %s", strerror(errno));
+                          close(masterFd);
+                          freeCharArray(cmdArgs);
+                          freeCharArray(envArgs);
+                          return 0;
+                      }
+                      
+                      slaveFd = open(slaveName, O_RDWR | O_NOCTTY);
+                      if (slaveFd == -1) {
+                          LOGE("open slave falhou: %s", strerror(errno));
+                          close(masterFd);
                           freeCharArray(cmdArgs);
                           freeCharArray(envArgs);
                           return 0;
@@ -232,9 +268,9 @@ jobs:
               jobject thiz,
               jlong fd)
           {
-              LOGI("closeSubprocess: fd=%lld", fd);
+              LOGI("closeSubprocess: fd=%ld", (long)fd);
               if (fd != -1) {
-                  close(static_cast<int>(fd));
+                  close((int)fd);
               }
           }
 
@@ -244,7 +280,7 @@ jobs:
               jobject thiz,
               jlong fd)
           {
-              LOGI("waitFor: fd=%lld", fd);
+              LOGI("waitFor: fd=%ld", (long)fd);
               
               int status;
               pid_t result = wait(&status);
@@ -275,7 +311,7 @@ jobs:
               jint cols,
               jint rows)
           {
-              LOGI("setPtyWindowSize: fd=%lld, cols=%d, rows=%d", fd, cols, rows);
+              LOGI("setPtyWindowSize: fd=%ld, cols=%d, rows=%d", (long)fd, cols, rows);
               
               if (fd != -1) {
                   struct winsize ws;
@@ -284,7 +320,7 @@ jobs:
                   ws.ws_xpixel = 0;
                   ws.ws_ypixel = 0;
                   
-                  if (ioctl(static_cast<int>(fd), TIOCSWINSZ, &ws) == -1) {
+                  if (ioctl((int)fd, TIOCSWINSZ, &ws) == -1) {
                       LOGE("ioctl TIOCSWINSZ falhou: %s", strerror(errno));
                   }
               }
@@ -297,7 +333,7 @@ jobs:
               jlong fd,
               jboolean utf8Mode)
           {
-              LOGI("setPtyUTF8Mode: fd=%lld, mode=%d", fd, utf8Mode);
+              LOGI("setPtyUTF8Mode: fd=%ld, mode=%d", (long)fd, utf8Mode);
           }
 
           JNIEXPORT jstring JNICALL
@@ -345,15 +381,16 @@ jobs:
         run: |
           cat > src/terminal/pty.cpp << 'EOF'
           #include "pty.h"
-          #include <pty.h>
           #include <fcntl.h>
           #include <sys/ioctl.h>
           #include <unistd.h>
           #include <cstring>
           #include <android/log.h>
+          #include <errno.h>
 
           #define LOG_TAG "TermuxPty"
           #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           Pty::Pty() : masterFd(-1), slaveFd(-1) {
               memset(&originalTermios, 0, sizeof(originalTermios));
@@ -364,10 +401,44 @@ jobs:
           }
 
           bool Pty::open() {
-              if (::openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
-                  LOGE("openpty falhou: %s", strerror(errno));
+              // ===== ABRE O PTY NO ANDROID =====
+              masterFd = posix_openpt(O_RDWR | O_NOCTTY);
+              if (masterFd == -1) {
+                  LOGE("posix_openpt falhou: %s", strerror(errno));
                   return false;
               }
+              
+              if (grantpt(masterFd) == -1) {
+                  LOGE("grantpt falhou: %s", strerror(errno));
+                  close(masterFd);
+                  masterFd = -1;
+                  return false;
+              }
+              
+              if (unlockpt(masterFd) == -1) {
+                  LOGE("unlockpt falhou: %s", strerror(errno));
+                  close(masterFd);
+                  masterFd = -1;
+                  return false;
+              }
+              
+              char* slaveName = ptsname(masterFd);
+              if (slaveName == nullptr) {
+                  LOGE("ptsname falhou: %s", strerror(errno));
+                  close(masterFd);
+                  masterFd = -1;
+                  return false;
+              }
+              
+              slaveFd = open(slaveName, O_RDWR | O_NOCTTY);
+              if (slaveFd == -1) {
+                  LOGE("open slave falhou: %s", strerror(errno));
+                  close(masterFd);
+                  masterFd = -1;
+                  return false;
+              }
+              
+              LOGI("PTY aberto: master=%d, slave=%d, name=%s", masterFd, slaveFd, slaveName);
               return true;
           }
 
@@ -395,6 +466,7 @@ jobs:
           }
 
           bool Pty::setUTF8Mode(bool enable) {
+              // Implementação para UTF-8
               return true;
           }
           EOF
@@ -541,7 +613,6 @@ jobs:
           TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
           SYSROOT="$TOOLCHAIN/sysroot"
           
-          # Define o compilador
           if [[ "${{ matrix.abi }}" == "armeabi-v7a" ]]; then
             CLANG="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang++"
             TARGET="armv7a-none-linux-androideabi21"
