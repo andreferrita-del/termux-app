@@ -167,7 +167,6 @@ jobs:
                   int slaveFd = -1;
                   
                   if (usePty) {
-                      // Usa posix_openpt em vez de openpty
                       masterFd = posix_openpt(O_RDWR | O_NOCTTY);
                       if (masterFd == -1) {
                           LOGE("posix_openpt falhou: %s", strerror(errno));
@@ -401,7 +400,6 @@ jobs:
           }
 
           bool Pty::open() {
-              // ===== ABRE O PTY NO ANDROID =====
               masterFd = posix_openpt(O_RDWR | O_NOCTTY);
               if (masterFd == -1) {
                   LOGE("posix_openpt falhou: %s", strerror(errno));
@@ -466,7 +464,6 @@ jobs:
           }
 
           bool Pty::setUTF8Mode(bool enable) {
-              // Implementação para UTF-8
               return true;
           }
           EOF
@@ -497,7 +494,7 @@ jobs:
               
           private:
               pid_t pid;
-              bool running;
+              mutable bool running;
           };
 
           #endif // PROCESS_H
@@ -558,23 +555,37 @@ jobs:
 
           bool Process::isRunning() const {
               if (!running || pid == -1) return false;
+              
               int status;
               pid_t result = waitpid(pid, &status, WNOHANG);
-              if (result == 0) return true;
+              
+              if (result == 0) {
+                  return true;
+              }
+              
               if (result == pid) {
-                  running = false;
                   return false;
               }
+              
               return false;
           }
 
           int Process::waitFor() {
               if (!running || pid == -1) return -1;
+              
               int status;
               pid_t result = waitpid(pid, &status, 0);
+              
+              if (result == -1) {
+                  return -1;
+              }
+              
               running = false;
-              if (result == -1) return -1;
-              if (WIFEXITED(status)) return WEXITSTATUS(status);
+              
+              if (WIFEXITED(status)) {
+                  return WEXITSTATUS(status);
+              }
+              
               return status;
           }
 
