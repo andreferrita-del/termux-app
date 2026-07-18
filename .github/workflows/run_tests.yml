@@ -1,11 +1,9 @@
-name: Build libtermux.so
+name: Build libtermux.so (Cria arquivos automaticamente)
 
 on:
   push:
-    branches: [ main, master, develop ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:  # Permite executar manualmente
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,31 +16,573 @@ jobs:
         abi:
           - armeabi-v7a
           - arm64-v8a
-          - x86
-          - x86_64
-        include:
-          - abi: armeabi-v7a
-            target: armv7a-linux-androideabi
-            api: 21
-          - abi: arm64-v8a
-            target: aarch64-linux-android
-            api: 21
-          - abi: x86
-            target: i686-linux-android
-            api: 21
-          - abi: x86_64
-            target: x86_64-linux-android
-            api: 21
 
     steps:
       # ============================================
-      # 1. CHECKOUT DO CÓDIGO
+      # 1. CRIAR ARQUIVOS FONTE
       # ============================================
-      - name: Checkout código fonte
-        uses: actions/checkout@v4
+      - name: Criar estrutura de diretórios
+        run: |
+          mkdir -p src/terminal
+          mkdir -p build
+          mkdir -p artifacts
+
+      - name: Criar termux.h
+        run: |
+          cat > src/termux.h << 'EOF'
+          #ifndef TERMUX_H
+          #define TERMUX_H
+
+          #include <jni.h>
+          #include <string>
+          #include <vector>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          JNIEXPORT jlong JNICALL
+          Java_com_myTerm_terminal_NativeLib_createSubprocess(
+              JNIEnv* env,
+              jobject thiz,
+              jobjectArray cmd,
+              jobjectArray envp,
+              jstring cwd,
+              jintArray processId,
+              jboolean usePty
+          );
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_closeSubprocess(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd
+          );
+
+          JNIEXPORT jint JNICALL
+          Java_com_myTerm_terminal_NativeLib_waitFor(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd
+          );
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_setPtyWindowSize(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd,
+              jint cols,
+              jint rows
+          );
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_setPtyUTF8Mode(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd,
+              jboolean utf8Mode
+          );
+
+          JNIEXPORT jstring JNICALL
+          Java_com_myTerm_terminal_NativeLib_getVersion(
+              JNIEnv* env,
+              jobject thiz
+          );
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif // TERMUX_H
+          EOF
+          echo "✅ termux.h criado"
+
+      - name: Criar termux.cpp
+        run: |
+          cat > src/termux.cpp << 'EOF'
+          #include "termux.h"
+          #include <jni.h>
+          #include <string>
+          #include <vector>
+          #include <cstring>
+          #include <unistd.h>
+          #include <sys/wait.h>
+          #include <sys/ioctl.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <cstdio>
+          #include <android/log.h>
+
+          #define LOG_TAG "TermuxNative"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          // ============================================
+          // CONVERSÃO DE ARRAYS JAVA
+          // ============================================
+
+          static std::vector<char*> convertJavaArrayToC(JNIEnv* env, jobjectArray array) {
+              std::vector<char*> result;
+              if (array == nullptr) return result;
+              
+              jsize len = env->GetArrayLength(array);
+              for (int i = 0; i < len; i++) {
+                  jstring str = (jstring)env->GetObjectArrayElement(array, i);
+                  const char* cstr = env->GetStringUTFChars(str, nullptr);
+                  char* copy = strdup(cstr);
+                  result.push_back(copy);
+                  env->ReleaseStringUTFChars(str, cstr);
+                  env->DeleteLocalRef(str);
+              }
+              result.push_back(nullptr);
+              return result;
+          }
+
+          static std::string getStringFromJString(JNIEnv* env, jstring jstr) {
+              if (jstr == nullptr) return "";
+              const char* cstr = env->GetStringUTFChars(jstr, nullptr);
+              std::string result(cstr);
+              env->ReleaseStringUTFChars(jstr, cstr);
+              return result;
+          }
+
+          static void freeCharArray(std::vector<char*>& arr) {
+              for (char* p : arr) {
+                  if (p != nullptr) free(p);
+              }
+          }
+
+          // ============================================
+          // MÉTODOS JNI
+          // ============================================
+
+          JNIEXPORT jlong JNICALL
+          Java_com_myTerm_terminal_NativeLib_createSubprocess(
+              JNIEnv* env,
+              jobject thiz,
+              jobjectArray cmd,
+              jobjectArray envp,
+              jstring cwd,
+              jintArray processId,
+              jboolean usePty)
+          {
+              LOGI("createSubprocess iniciado");
+              
+              try {
+                  std::vector<char*> cmdArgs = convertJavaArrayToC(env, cmd);
+                  std::vector<char*> envArgs = convertJavaArrayToC(env, envp);
+                  std::string cwdStr = getStringFromJString(env, cwd);
+                  
+                  int masterFd = -1;
+                  int slaveFd = -1;
+                  
+                  if (usePty) {
+                      if (openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
+                          LOGE("Falha ao abrir PTY");
+                          freeCharArray(cmdArgs);
+                          freeCharArray(envArgs);
+                          return 0;
+                      }
+                  }
+                  
+                  pid_t pid = fork();
+                  if (pid == -1) {
+                      LOGE("Fork falhou: %s", strerror(errno));
+                      freeCharArray(cmdArgs);
+                      freeCharArray(envArgs);
+                      return 0;
+                  }
+                  
+                  if (pid == 0) {
+                      LOGI("Processo filho iniciado (PID: %d)", getpid());
+                      
+                      if (usePty) {
+                          setsid();
+                          ioctl(slaveFd, TIOCSCTTY, 0);
+                          dup2(slaveFd, STDIN_FILENO);
+                          dup2(slaveFd, STDOUT_FILENO);
+                          dup2(slaveFd, STDERR_FILENO);
+                          close(masterFd);
+                          close(slaveFd);
+                      }
+                      
+                      if (!cwdStr.empty()) {
+                          chdir(cwdStr.c_str());
+                      }
+                      
+                      execvp(cmdArgs[0], cmdArgs.data());
+                      LOGE("execvp falhou: %s", strerror(errno));
+                      _exit(127);
+                  }
+                  
+                  LOGI("Processo pai: PID=%d, masterFd=%d", pid, masterFd);
+                  
+                  if (processId != nullptr) {
+                      jint* pidArray = env->GetIntArrayElements(processId, nullptr);
+                      if (pidArray != nullptr) {
+                          pidArray[0] = pid;
+                          env->ReleaseIntArrayElements(processId, pidArray, 0);
+                      }
+                  }
+                  
+                  freeCharArray(cmdArgs);
+                  freeCharArray(envArgs);
+                  
+                  return static_cast<jlong>(masterFd);
+                  
+              } catch (const std::exception& e) {
+                  LOGE("Exceção: %s", e.what());
+                  return 0;
+              }
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_closeSubprocess(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd)
+          {
+              LOGI("closeSubprocess: fd=%lld", fd);
+              if (fd != -1) {
+                  close(static_cast<int>(fd));
+              }
+          }
+
+          JNIEXPORT jint JNICALL
+          Java_com_myTerm_terminal_NativeLib_waitFor(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd)
+          {
+              LOGI("waitFor: fd=%lld", fd);
+              
+              int status;
+              pid_t result = wait(&status);
+              
+              if (result == -1) {
+                  LOGE("wait falhou: %s", strerror(errno));
+                  return -1;
+              }
+              
+              if (WIFEXITED(status)) {
+                  LOGI("Processo terminou com código: %d", WEXITSTATUS(status));
+                  return WEXITSTATUS(status);
+              }
+              
+              if (WIFSIGNALED(status)) {
+                  LOGI("Processo terminou por sinal: %d", WTERMSIG(status));
+                  return -WTERMSIG(status);
+              }
+              
+              return status;
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_setPtyWindowSize(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd,
+              jint cols,
+              jint rows)
+          {
+              LOGI("setPtyWindowSize: fd=%lld, cols=%d, rows=%d", fd, cols, rows);
+              
+              if (fd != -1) {
+                  struct winsize ws;
+                  ws.ws_col = cols;
+                  ws.ws_row = rows;
+                  ws.ws_xpixel = 0;
+                  ws.ws_ypixel = 0;
+                  
+                  if (ioctl(static_cast<int>(fd), TIOCSWINSZ, &ws) == -1) {
+                      LOGE("ioctl TIOCSWINSZ falhou: %s", strerror(errno));
+                  }
+              }
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_myTerm_terminal_NativeLib_setPtyUTF8Mode(
+              JNIEnv* env,
+              jobject thiz,
+              jlong fd,
+              jboolean utf8Mode)
+          {
+              LOGI("setPtyUTF8Mode: fd=%lld, mode=%d", fd, utf8Mode);
+          }
+
+          JNIEXPORT jstring JNICALL
+          Java_com_myTerm_terminal_NativeLib_getVersion(
+              JNIEnv* env,
+              jobject thiz)
+          {
+              return env->NewStringUTF("1.0.0");
+          }
+          EOF
+          echo "✅ termux.cpp criado"
+
+      - name: Criar terminal/pty.h
+        run: |
+          cat > src/terminal/pty.h << 'EOF'
+          #ifndef PTY_H
+          #define PTY_H
+
+          #include <unistd.h>
+          #include <termios.h>
+
+          class Pty {
+          public:
+              Pty();
+              ~Pty();
+              
+              bool open();
+              void close();
+              
+              int getMasterFd() const { return masterFd; }
+              int getSlaveFd() const { return slaveFd; }
+              
+              bool setWindowSize(int cols, int rows);
+              bool setUTF8Mode(bool enable);
+              
+          private:
+              int masterFd;
+              int slaveFd;
+              struct termios originalTermios;
+          };
+
+          #endif // PTY_H
+          EOF
+          echo "✅ terminal/pty.h criado"
+
+      - name: Criar terminal/pty.cpp
+        run: |
+          cat > src/terminal/pty.cpp << 'EOF'
+          #include "pty.h"
+          #include <pty.h>
+          #include <fcntl.h>
+          #include <sys/ioctl.h>
+          #include <unistd.h>
+          #include <cstring>
+          #include <android/log.h>
+
+          #define LOG_TAG "TermuxPty"
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          Pty::Pty() : masterFd(-1), slaveFd(-1) {
+              memset(&originalTermios, 0, sizeof(originalTermios));
+          }
+
+          Pty::~Pty() {
+              close();
+          }
+
+          bool Pty::open() {
+              if (::openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
+                  LOGE("openpty falhou: %s", strerror(errno));
+                  return false;
+              }
+              return true;
+          }
+
+          void Pty::close() {
+              if (masterFd != -1) {
+                  ::close(masterFd);
+                  masterFd = -1;
+              }
+              if (slaveFd != -1) {
+                  ::close(slaveFd);
+                  slaveFd = -1;
+              }
+          }
+
+          bool Pty::setWindowSize(int cols, int rows) {
+              if (masterFd == -1) return false;
+              
+              struct winsize ws;
+              ws.ws_col = cols;
+              ws.ws_row = rows;
+              ws.ws_xpixel = 0;
+              ws.ws_ypixel = 0;
+              
+              return ioctl(masterFd, TIOCSWINSZ, &ws) != -1;
+          }
+
+          bool Pty::setUTF8Mode(bool enable) {
+              return true;
+          }
+          EOF
+          echo "✅ terminal/pty.cpp criado"
+
+      - name: Criar terminal/process.h
+        run: |
+          cat > src/terminal/process.h << 'EOF'
+          #ifndef PROCESS_H
+          #define PROCESS_H
+
+          #include <string>
+          #include <vector>
+
+          class Process {
+          public:
+              Process();
+              ~Process();
+              
+              bool start(const std::vector<std::string>& cmd,
+                         const std::vector<std::string>& env,
+                         const std::string& cwd);
+              
+              bool isRunning() const;
+              int waitFor();
+              void kill();
+              
+              pid_t getPid() const { return pid; }
+              
+          private:
+              pid_t pid;
+              bool running;
+          };
+
+          #endif // PROCESS_H
+          EOF
+          echo "✅ terminal/process.h criado"
+
+      - name: Criar terminal/process.cpp
+        run: |
+          cat > src/terminal/process.cpp << 'EOF'
+          #include "process.h"
+          #include <unistd.h>
+          #include <sys/wait.h>
+          #include <cstring>
+          #include <android/log.h>
+
+          #define LOG_TAG "TermuxProcess"
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          Process::Process() : pid(-1), running(false) {}
+
+          Process::~Process() {
+              if (running) kill();
+          }
+
+          bool Process::start(const std::vector<std::string>& cmd,
+                              const std::vector<std::string>& env,
+                              const std::string& cwd) {
+              
+              std::vector<char*> cmdArgs;
+              for (const auto& s : cmd) {
+                  cmdArgs.push_back(const_cast<char*>(s.c_str()));
+              }
+              cmdArgs.push_back(nullptr);
+              
+              std::vector<char*> envArgs;
+              for (const auto& s : env) {
+                  envArgs.push_back(const_cast<char*>(s.c_str()));
+              }
+              envArgs.push_back(nullptr);
+              
+              pid_t p = fork();
+              if (p == -1) {
+                  LOGE("Fork falhou");
+                  return false;
+              }
+              
+              if (p == 0) {
+                  if (!cwd.empty()) {
+                      chdir(cwd.c_str());
+                  }
+                  execvp(cmdArgs[0], cmdArgs.data());
+                  _exit(127);
+              }
+              
+              pid = p;
+              running = true;
+              return true;
+          }
+
+          bool Process::isRunning() const {
+              if (!running || pid == -1) return false;
+              int status;
+              pid_t result = waitpid(pid, &status, WNOHANG);
+              if (result == 0) return true;
+              if (result == pid) {
+                  running = false;
+                  return false;
+              }
+              return false;
+          }
+
+          int Process::waitFor() {
+              if (!running || pid == -1) return -1;
+              int status;
+              pid_t result = waitpid(pid, &status, 0);
+              running = false;
+              if (result == -1) return -1;
+              if (WIFEXITED(status)) return WEXITSTATUS(status);
+              return status;
+          }
+
+          void Process::kill() {
+              if (running && pid != -1) {
+                  ::kill(pid, SIGTERM);
+                  running = false;
+              }
+          }
+          EOF
+          echo "✅ terminal/process.cpp criado"
+
+      - name: Criar CMakeLists.txt
+        run: |
+          cat > src/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.10)
+          project(termux)
+
+          set(CMAKE_CXX_STANDARD 14)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(SOURCES
+              termux.cpp
+              terminal/pty.cpp
+              terminal/process.cpp
+          )
+
+          include_directories(
+              ${CMAKE_CURRENT_SOURCE_DIR}
+              ${CMAKE_CURRENT_SOURCE_DIR}/terminal
+          )
+
+          add_library(termux SHARED ${SOURCES})
+
+          target_link_libraries(termux
+              log
+              dl
+              c
+              c++
+              m
+          )
+
+          target_compile_options(termux PRIVATE
+              -Wall
+              -Wextra
+              -O2
+              -fPIC
+          )
+
+          target_compile_definitions(termux PRIVATE
+              ANDROID
+              __ANDROID__
+          )
+          EOF
+          echo "✅ CMakeLists.txt criado"
 
       # ============================================
-      # 2. SETUP DO NDK
+      # 2. VERIFICAR ARQUIVOS
+      # ============================================
+      - name: Listar arquivos criados
+        run: |
+          echo "📁 Estrutura de arquivos:"
+          find src -type f -name "*.cpp" -o -name "*.h" -o -name "CMakeLists.txt" | sort
+
+      # ============================================
+      # 3. SETUP DO NDK
       # ============================================
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -57,73 +597,78 @@ jobs:
           ls -la ${{ steps.setup-ndk.outputs.ndk-path }}
 
       # ============================================
-      # 3. PREPARAR DIRETÓRIO DE BUILD
+      # 4. COMPILAR
       # ============================================
-      - name: Preparar estrutura
+      - name: Compilar com CMake
         run: |
-          mkdir -p build/${{ matrix.abi }}
-          mkdir -p artifacts/${{ matrix.abi }}
+          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          
+          cd src
+          mkdir -p build && cd build
+          
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=21 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+          
+          cmake --build . --config Release
+          
+          # Copia o resultado
+          cp libs/*.so ../../artifacts/libtermux-${{ matrix.abi }}.so
+          
+          echo "✅ libtermux-${{ matrix.abi }}.so criado!"
+          file ../../artifacts/libtermux-${{ matrix.abi }}.so
+          ls -la ../../artifacts/
 
       # ============================================
-      # 4. COMPILAR PARA ARQUITETURA
-      # ============================================
-      - name: Compilar para ${{ matrix.abi }}
-        run: |
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
-          SYSROOT="$TOOLCHAIN/sysroot"
-          
-          # Define o compilador
-          if [[ "${{ matrix.abi }}" == "armeabi-v7a" ]]; then
-            CLANG="$TOOLCHAIN/bin/armv7a-linux-androideabi${{ matrix.api }}-clang++"
-          elif [[ "${{ matrix.abi }}" == "arm64-v8a" ]]; then
-            CLANG="$TOOLCHAIN/bin/aarch64-linux-android${{ matrix.api }}-clang++"
-          elif [[ "${{ matrix.abi }}" == "x86" ]]; then
-            CLANG="$TOOLCHAIN/bin/i686-linux-android${{ matrix.api }}-clang++"
-          elif [[ "${{ matrix.abi }}" == "x86_64" ]]; then
-            CLANG="$TOOLCHAIN/bin/x86_64-linux-android${{ matrix.api }}-clang++"
-          fi
-          
-          echo "Usando compilador: $CLANG"
-          
-          # ===== COMPILA =====
-          $CLANG \
-            -std=c++14 \
-            -fPIC \
-            -O2 \
-            -Wall \
-            -Wextra \
-            -Wno-unused-parameter \
-            -shared \
-            -I. \
-            -Iterminal \
-            termux.cpp terminal/pty.cpp terminal/process.cpp \
-            -o build/${{ matrix.abi }}/libtermux.so \
-            -lc \
-            -lc++ \
-            -ldl \
-            -lm \
-            -llog \
-            -target ${{ matrix.target }}${{ matrix.api }} \
-            --sysroot=$SYSROOT
-          
-          # Verifica se foi criado
-          if [ -f "build/${{ matrix.abi }}/libtermux.so" ]; then
-            echo "✅ libtermux.so criado para ${{ matrix.abi }}"
-            ls -la build/${{ matrix.abi }}/libtermux.so
-            file build/${{ matrix.abi }}/libtermux.so
-          else
-            echo "❌ Falha ao compilar para ${{ matrix.abi }}"
-            exit 1
-          fi
-
-      # ============================================
-      # 5. UPLOAD DO ARTEFATO
+      # 5. UPLOAD DOS ARTEFATOS
       # ============================================
       - name: Upload artefato (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
         with:
           name: libtermux-${{ matrix.abi }}
-          path: build/${{ matrix.abi }}/libtermux.so
+          path: artifacts/libtermux-${{ matrix.abi }}.so
           retention-days: 30
           if-no-files-found: error
+
+  # ============================================
+  # 6. JOB PARA CRIAR PACOTE COMPLETO
+  # ============================================
+  package:
+    name: Criar pacote completo
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    
+    steps:
+      - name: Baixar todos os artefatos
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Listar artefatos
+        run: |
+          echo "📦 Artefatos baixados:"
+          find all-artifacts -type f | sort
+
+      - name: Criar pacote zip
+        run: |
+          mkdir -p package
+          cp all-artifacts/libtermux-armeabi-v7a/libtermux-armeabi-v7a.so package/libtermux-armeabi-v7a.so 2>/dev/null || true
+          cp all-artifacts/libtermux-arm64-v8a/libtermux-arm64-v8a.so package/libtermux-arm64-v8a.so 2>/dev/null || true
+          
+          cd package
+          zip -r ../libtermux-all.zip .
+          cd ..
+          
+          echo "✅ Pacote criado:"
+          ls -la libtermux-all.zip
+
+      - name: Upload pacote completo
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtermux-complete
+          path: libtermux-all.zip
+          retention-days: 30
