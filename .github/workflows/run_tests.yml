@@ -1,4 +1,4 @@
-name: Build libtermux.so
+name: Build libtermux.so (NDK)
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Compilar libtermux.so
+    name: Compilar libtermux.so com NDK
     runs-on: ubuntu-latest
     
     strategy:
@@ -16,6 +16,8 @@ jobs:
         abi:
           - armeabi-v7a
           - arm64-v8a
+          - x86
+          - x86_64
 
     steps:
       # ============================================
@@ -23,12 +25,48 @@ jobs:
       # ============================================
       - name: Criar estrutura de diretórios
         run: |
-          mkdir -p src/terminal
-          mkdir -p artifacts
+          mkdir -p jni/terminal
+          mkdir -p libs
+
+      - name: Criar Android.mk
+        run: |
+          cat > jni/Android.mk << 'EOF'
+          LOCAL_PATH := $(call my-dir)
+
+          include $(CLEAR_VARS)
+
+          LOCAL_MODULE := termux
+
+          LOCAL_SRC_FILES := \
+              termux.cpp \
+              terminal/pty.cpp \
+              terminal/process.cpp
+
+          LOCAL_C_INCLUDES := \
+              $(LOCAL_PATH) \
+              $(LOCAL_PATH)/terminal
+
+          LOCAL_CPPFLAGS := -std=c++14 -fPIC -O2 -Wall -Wextra -Wno-unused-parameter
+          LOCAL_CFLAGS := -std=c11 -fPIC -O2 -Wall
+
+          LOCAL_LDLIBS := -llog -ldl -lc -lc++ -lm
+
+          include $(BUILD_SHARED_LIBRARY)
+          EOF
+
+      - name: Criar Application.mk
+        run: |
+          cat > jni/Application.mk << 'EOF'
+          APP_ABI := armeabi-v7a arm64-v8a x86 x86_64
+          APP_PLATFORM := android-21
+          APP_STL := c++_shared
+          APP_CPPFLAGS := -std=c++14 -frtti -fexceptions
+          APP_OPTIM := release
+          EOF
 
       - name: Criar termux.h
         run: |
-          cat > src/termux.h << 'EOF'
+          cat > jni/termux.h << 'EOF'
           #ifndef TERMUX_H
           #define TERMUX_H
 
@@ -97,7 +135,7 @@ jobs:
 
       - name: Criar termux.cpp
         run: |
-          cat > src/termux.cpp << 'EOF'
+          cat > jni/termux.cpp << 'EOF'
           #include "termux.h"
           #include <jni.h>
           #include <string>
@@ -110,6 +148,7 @@ jobs:
           #include <errno.h>
           #include <cstdio>
           #include <android/log.h>
+          #include <pty.h>
 
           #define LOG_TAG "TermuxNative"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -167,43 +206,8 @@ jobs:
                   int slaveFd = -1;
                   
                   if (usePty) {
-                      masterFd = posix_openpt(O_RDWR | O_NOCTTY);
-                      if (masterFd == -1) {
-                          LOGE("posix_openpt falhou: %s", strerror(errno));
-                          freeCharArray(cmdArgs);
-                          freeCharArray(envArgs);
-                          return 0;
-                      }
-                      
-                      if (grantpt(masterFd) == -1) {
-                          LOGE("grantpt falhou: %s", strerror(errno));
-                          close(masterFd);
-                          freeCharArray(cmdArgs);
-                          freeCharArray(envArgs);
-                          return 0;
-                      }
-                      
-                      if (unlockpt(masterFd) == -1) {
-                          LOGE("unlockpt falhou: %s", strerror(errno));
-                          close(masterFd);
-                          freeCharArray(cmdArgs);
-                          freeCharArray(envArgs);
-                          return 0;
-                      }
-                      
-                      char* slaveName = ptsname(masterFd);
-                      if (slaveName == nullptr) {
-                          LOGE("ptsname falhou: %s", strerror(errno));
-                          close(masterFd);
-                          freeCharArray(cmdArgs);
-                          freeCharArray(envArgs);
-                          return 0;
-                      }
-                      
-                      slaveFd = open(slaveName, O_RDWR | O_NOCTTY);
-                      if (slaveFd == -1) {
-                          LOGE("open slave falhou: %s", strerror(errno));
-                          close(masterFd);
+                      if (openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
+                          LOGE("openpty falhou: %s", strerror(errno));
                           freeCharArray(cmdArgs);
                           freeCharArray(envArgs);
                           return 0;
@@ -346,7 +350,7 @@ jobs:
 
       - name: Criar terminal/pty.h
         run: |
-          cat > src/terminal/pty.h << 'EOF'
+          cat > jni/terminal/pty.h << 'EOF'
           #ifndef PTY_H
           #define PTY_H
 
@@ -378,7 +382,7 @@ jobs:
 
       - name: Criar terminal/pty.cpp
         run: |
-          cat > src/terminal/pty.cpp << 'EOF'
+          cat > jni/terminal/pty.cpp << 'EOF'
           #include "pty.h"
           #include <fcntl.h>
           #include <sys/ioctl.h>
@@ -386,6 +390,7 @@ jobs:
           #include <cstring>
           #include <android/log.h>
           #include <errno.h>
+          #include <pty.h>
 
           #define LOG_TAG "TermuxPty"
           #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -400,43 +405,12 @@ jobs:
           }
 
           bool Pty::open() {
-              masterFd = posix_openpt(O_RDWR | O_NOCTTY);
-              if (masterFd == -1) {
-                  LOGE("posix_openpt falhou: %s", strerror(errno));
+              if (openpty(&masterFd, &slaveFd, nullptr, nullptr, nullptr) == -1) {
+                  LOGE("openpty falhou: %s", strerror(errno));
                   return false;
               }
               
-              if (grantpt(masterFd) == -1) {
-                  LOGE("grantpt falhou: %s", strerror(errno));
-                  close(masterFd);
-                  masterFd = -1;
-                  return false;
-              }
-              
-              if (unlockpt(masterFd) == -1) {
-                  LOGE("unlockpt falhou: %s", strerror(errno));
-                  close(masterFd);
-                  masterFd = -1;
-                  return false;
-              }
-              
-              char* slaveName = ptsname(masterFd);
-              if (slaveName == nullptr) {
-                  LOGE("ptsname falhou: %s", strerror(errno));
-                  close(masterFd);
-                  masterFd = -1;
-                  return false;
-              }
-              
-              slaveFd = open(slaveName, O_RDWR | O_NOCTTY);
-              if (slaveFd == -1) {
-                  LOGE("open slave falhou: %s", strerror(errno));
-                  close(masterFd);
-                  masterFd = -1;
-                  return false;
-              }
-              
-              LOGI("PTY aberto: master=%d, slave=%d, name=%s", masterFd, slaveFd, slaveName);
+              LOGI("PTY aberto: master=%d, slave=%d", masterFd, slaveFd);
               return true;
           }
 
@@ -470,7 +444,7 @@ jobs:
 
       - name: Criar terminal/process.h
         run: |
-          cat > src/terminal/process.h << 'EOF'
+          cat > jni/terminal/process.h << 'EOF'
           #ifndef PROCESS_H
           #define PROCESS_H
 
@@ -502,7 +476,7 @@ jobs:
 
       - name: Criar terminal/process.cpp
         run: |
-          cat > src/terminal/process.cpp << 'EOF'
+          cat > jni/terminal/process.cpp << 'EOF'
           #include "process.h"
           #include <unistd.h>
           #include <sys/wait.h>
@@ -603,7 +577,7 @@ jobs:
       - name: Listar arquivos criados
         run: |
           echo "📁 Estrutura de arquivos:"
-          find src -type f | sort
+          find jni -type f | sort
 
       # ============================================
       # 3. SETUP DO NDK
@@ -613,63 +587,56 @@ jobs:
         id: setup-ndk
         with:
           ndk-version: r26d
-          add-to-path: false
+          add-to-path: true
+
+      - name: Verificar NDK
+        run: |
+          echo "NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}"
+          ls -la ${{ steps.setup-ndk.outputs.ndk-path }}
 
       # ============================================
-      # 4. COMPILAR DIRETAMENTE COM CLANG
+      # 4. COMPILAR COM NDK-BUILD
       # ============================================
-      - name: Compilar para ${{ matrix.abi }}
+      - name: Compilar com ndk-build
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
-          SYSROOT="$TOOLCHAIN/sysroot"
+          export PATH=$NDK_PATH:$PATH
           
-          if [[ "${{ matrix.abi }}" == "armeabi-v7a" ]]; then
-            CLANG="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang++"
-            TARGET="armv7a-none-linux-androideabi21"
-          elif [[ "${{ matrix.abi }}" == "arm64-v8a" ]]; then
-            CLANG="$TOOLCHAIN/bin/aarch64-linux-android21-clang++"
-            TARGET="aarch64-none-linux-android21"
-          fi
+          echo "🔨 Compilando com ndk-build..."
           
-          echo "🔨 Compilando para ${{ matrix.abi }}..."
-          echo "Usando: $CLANG"
+          ndk-build -C jni \
+            APP_ABI=${{ matrix.abi }} \
+            APP_PLATFORM=android-21 \
+            APP_STL=c++_shared \
+            APP_OPTIM=release \
+            -j$(nproc)
           
-          cd src
-          
-          $CLANG \
-            -std=c++14 \
-            -fPIC \
-            -O2 \
-            -Wall \
-            -Wextra \
-            -Wno-unused-parameter \
-            -shared \
-            -I. \
-            -Iterminal \
-            termux.cpp terminal/pty.cpp terminal/process.cpp \
-            -o ../artifacts/libtermux-${{ matrix.abi }}.so \
-            -lc \
-            -lc++ \
-            -ldl \
-            -lm \
-            -llog \
-            -target $TARGET \
-            --sysroot=$SYSROOT
-          
-          cd ..
-          
-          if [ -f "artifacts/libtermux-${{ matrix.abi }}.so" ]; then
-            echo "✅ libtermux-${{ matrix.abi }}.so criado!"
-            ls -la artifacts/libtermux-${{ matrix.abi }}.so
-            file artifacts/libtermux-${{ matrix.abi }}.so
+          # Verifica resultado
+          if [ -d "jni/libs/${{ matrix.abi }}" ]; then
+            echo "✅ libtermux.so criado para ${{ matrix.abi }}!"
+            ls -la jni/libs/${{ matrix.abi }}/
+            file jni/libs/${{ matrix.abi }}/libtermux.so
           else
             echo "❌ Falha ao compilar para ${{ matrix.abi }}"
             exit 1
           fi
 
       # ============================================
-      # 5. UPLOAD DOS ARTEFATOS
+      # 5. COPIAR ARTEFATOS
+      # ============================================
+      - name: Copiar artefatos
+        run: |
+          mkdir -p artifacts
+          if [ -f "jni/libs/${{ matrix.abi }}/libtermux.so" ]; then
+            cp jni/libs/${{ matrix.abi }}/libtermux.so artifacts/libtermux-${{ matrix.abi }}.so
+            echo "✅ Artefato copiado!"
+          else
+            echo "❌ Artefato não encontrado!"
+            exit 1
+          fi
+
+      # ============================================
+      # 6. UPLOAD DOS ARTEFATOS
       # ============================================
       - name: Upload artefato (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
@@ -678,3 +645,43 @@ jobs:
           path: artifacts/libtermux-${{ matrix.abi }}.so
           retention-days: 30
           if-no-files-found: error
+
+  # ============================================
+  # 7. PACOTE COMPLETO
+  # ============================================
+  package:
+    name: Criar pacote completo
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    
+    steps:
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Criar pacote
+        run: |
+          mkdir -p package
+          
+          for dir in all-artifacts/*/; do
+            if [ -d "$dir" ]; then
+              cp "$dir"/*.so package/ 2>/dev/null || true
+            fi
+          done
+          
+          cd package
+          zip -r ../libtermux-all.zip *.so 2>/dev/null || true
+          cd ..
+          
+          echo "📦 Pacote criado:"
+          ls -la libtermux-all.zip
+          unzip -l libtermux-all.zip
+
+      - name: Upload pacote completo
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtermux-complete
+          path: libtermux-all.zip
+          retention-days: 30
