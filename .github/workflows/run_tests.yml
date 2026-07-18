@@ -1,4 +1,4 @@
-name: Build libtermux.so (Cria arquivos automaticamente)
+name: Build libtermux.so
 
 on:
   push:
@@ -24,7 +24,6 @@ jobs:
       - name: Criar estrutura de diretórios
         run: |
           mkdir -p src/terminal
-          mkdir -p build
           mkdir -p artifacts
 
       - name: Criar termux.h
@@ -95,7 +94,6 @@ jobs:
 
           #endif // TERMUX_H
           EOF
-          echo "✅ termux.h criado"
 
       - name: Criar termux.cpp
         run: |
@@ -116,10 +114,6 @@ jobs:
           #define LOG_TAG "TermuxNative"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
           #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
-          // ============================================
-          // CONVERSÃO DE ARRAYS JAVA
-          // ============================================
 
           static std::vector<char*> convertJavaArrayToC(JNIEnv* env, jobjectArray array) {
               std::vector<char*> result;
@@ -151,10 +145,6 @@ jobs:
                   if (p != nullptr) free(p);
               }
           }
-
-          // ============================================
-          // MÉTODOS JNI
-          // ============================================
 
           JNIEXPORT jlong JNICALL
           Java_com_myTerm_terminal_NativeLib_createSubprocess(
@@ -318,7 +308,6 @@ jobs:
               return env->NewStringUTF("1.0.0");
           }
           EOF
-          echo "✅ termux.cpp criado"
 
       - name: Criar terminal/pty.h
         run: |
@@ -351,7 +340,6 @@ jobs:
 
           #endif // PTY_H
           EOF
-          echo "✅ terminal/pty.h criado"
 
       - name: Criar terminal/pty.cpp
         run: |
@@ -410,7 +398,6 @@ jobs:
               return true;
           }
           EOF
-          echo "✅ terminal/pty.cpp criado"
 
       - name: Criar terminal/process.h
         run: |
@@ -443,7 +430,6 @@ jobs:
 
           #endif // PROCESS_H
           EOF
-          echo "✅ terminal/process.h criado"
 
       - name: Criar terminal/process.cpp
         run: |
@@ -527,51 +513,6 @@ jobs:
               }
           }
           EOF
-          echo "✅ terminal/process.cpp criado"
-
-      - name: Criar CMakeLists.txt
-        run: |
-          cat > src/CMakeLists.txt << 'EOF'
-          cmake_minimum_required(VERSION 3.10)
-          project(termux)
-
-          set(CMAKE_CXX_STANDARD 14)
-          set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-          set(SOURCES
-              termux.cpp
-              terminal/pty.cpp
-              terminal/process.cpp
-          )
-
-          include_directories(
-              ${CMAKE_CURRENT_SOURCE_DIR}
-              ${CMAKE_CURRENT_SOURCE_DIR}/terminal
-          )
-
-          add_library(termux SHARED ${SOURCES})
-
-          target_link_libraries(termux
-              log
-              dl
-              c
-              c++
-              m
-          )
-
-          target_compile_options(termux PRIVATE
-              -Wall
-              -Wextra
-              -O2
-              -fPIC
-          )
-
-          target_compile_definitions(termux PRIVATE
-              ANDROID
-              __ANDROID__
-          )
-          EOF
-          echo "✅ CMakeLists.txt criado"
 
       # ============================================
       # 2. VERIFICAR ARQUIVOS
@@ -579,7 +520,7 @@ jobs:
       - name: Listar arquivos criados
         run: |
           echo "📁 Estrutura de arquivos:"
-          find src -type f -name "*.cpp" -o -name "*.h" -o -name "CMakeLists.txt" | sort
+          find src -type f | sort
 
       # ============================================
       # 3. SETUP DO NDK
@@ -591,36 +532,59 @@ jobs:
           ndk-version: r26d
           add-to-path: false
 
-      - name: Verificar NDK
-        run: |
-          echo "NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}"
-          ls -la ${{ steps.setup-ndk.outputs.ndk-path }}
-
       # ============================================
-      # 4. COMPILAR
+      # 4. COMPILAR DIRETAMENTE COM CLANG
       # ============================================
-      - name: Compilar com CMake
+      - name: Compilar para ${{ matrix.abi }}
         run: |
-          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          
+          # Define o compilador
+          if [[ "${{ matrix.abi }}" == "armeabi-v7a" ]]; then
+            CLANG="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang++"
+            TARGET="armv7a-none-linux-androideabi21"
+          elif [[ "${{ matrix.abi }}" == "arm64-v8a" ]]; then
+            CLANG="$TOOLCHAIN/bin/aarch64-linux-android21-clang++"
+            TARGET="aarch64-none-linux-android21"
+          fi
+          
+          echo "🔨 Compilando para ${{ matrix.abi }}..."
+          echo "Usando: $CLANG"
           
           cd src
-          mkdir -p build && cd build
           
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=21 \
-            -DANDROID_STL=c++_shared \
-            -DCMAKE_BUILD_TYPE=Release
+          $CLANG \
+            -std=c++14 \
+            -fPIC \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Wno-unused-parameter \
+            -shared \
+            -I. \
+            -Iterminal \
+            termux.cpp terminal/pty.cpp terminal/process.cpp \
+            -o ../artifacts/libtermux-${{ matrix.abi }}.so \
+            -lc \
+            -lc++ \
+            -ldl \
+            -lm \
+            -llog \
+            -target $TARGET \
+            --sysroot=$SYSROOT
           
-          cmake --build . --config Release
+          cd ..
           
-          # Copia o resultado
-          cp libs/*.so ../../artifacts/libtermux-${{ matrix.abi }}.so
-          
-          echo "✅ libtermux-${{ matrix.abi }}.so criado!"
-          file ../../artifacts/libtermux-${{ matrix.abi }}.so
-          ls -la ../../artifacts/
+          if [ -f "artifacts/libtermux-${{ matrix.abi }}.so" ]; then
+            echo "✅ libtermux-${{ matrix.abi }}.so criado!"
+            ls -la artifacts/libtermux-${{ matrix.abi }}.so
+            file artifacts/libtermux-${{ matrix.abi }}.so
+          else
+            echo "❌ Falha ao compilar para ${{ matrix.abi }}"
+            exit 1
+          fi
 
       # ============================================
       # 5. UPLOAD DOS ARTEFATOS
@@ -632,43 +596,3 @@ jobs:
           path: artifacts/libtermux-${{ matrix.abi }}.so
           retention-days: 30
           if-no-files-found: error
-
-  # ============================================
-  # 6. JOB PARA CRIAR PACOTE COMPLETO
-  # ============================================
-  package:
-    name: Criar pacote completo
-    runs-on: ubuntu-latest
-    needs: build
-    if: always()
-    
-    steps:
-      - name: Baixar todos os artefatos
-        uses: actions/download-artifact@v4
-        with:
-          path: all-artifacts
-
-      - name: Listar artefatos
-        run: |
-          echo "📦 Artefatos baixados:"
-          find all-artifacts -type f | sort
-
-      - name: Criar pacote zip
-        run: |
-          mkdir -p package
-          cp all-artifacts/libtermux-armeabi-v7a/libtermux-armeabi-v7a.so package/libtermux-armeabi-v7a.so 2>/dev/null || true
-          cp all-artifacts/libtermux-arm64-v8a/libtermux-arm64-v8a.so package/libtermux-arm64-v8a.so 2>/dev/null || true
-          
-          cd package
-          zip -r ../libtermux-all.zip .
-          cd ..
-          
-          echo "✅ Pacote criado:"
-          ls -la libtermux-all.zip
-
-      - name: Upload pacote completo
-        uses: actions/upload-artifact@v4
-        with:
-          name: libtermux-complete
-          path: libtermux-all.zip
-          retention-days: 30
